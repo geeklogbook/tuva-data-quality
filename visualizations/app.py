@@ -1,8 +1,8 @@
 import streamlit as st
-import duckdb
 import pandas as pd
+from pathlib import Path
 
-DB_PATH = "/home/j/Documents/geeklogbook/tuva-data-quality/tuva.duckdb"
+DATA = Path(__file__).parent / "data"
 
 st.set_page_config(
     page_title="Tuva Analytics Hub",
@@ -13,37 +13,20 @@ st.set_page_config(
 
 @st.cache_data
 def load_quick_stats():
-    con = duckdb.connect(DB_PATH, read_only=True)
     stats = {}
     try:
-        stats["claims"]  = con.execute("SELECT COUNT(*) FROM main_input_layer.medical_claim").fetchone()[0]
-        stats["members"] = con.execute("SELECT COUNT(DISTINCT person_id) FROM main_input_layer.eligibility").fetchone()[0]
-        stats["paid"]    = con.execute("SELECT SUM(paid_amount) FROM main_input_layer.medical_claim").fetchone()[0]
+        row = pd.read_parquet(DATA / "quick_stats.parquet").iloc[0]
+        stats["claims"]  = int(row["claims"])
+        stats["members"] = int(row["members"])
+        stats["paid"]    = float(row["total_paid"])
     except Exception:
         pass
     try:
-        dq = con.execute("""
-            SELECT
-                SUM(CASE WHEN status = 'green'  THEN 1 ELSE 0 END) AS n_green,
-                SUM(CASE WHEN status = 'yellow' THEN 1 ELSE 0 END) AS n_yellow,
-                SUM(CASE WHEN status = 'red'    THEN 1 ELSE 0 END) AS n_red,
-                COUNT(*) AS n_total
-            FROM (
-                SELECT
-                    CASE
-                        WHEN green IS NULL THEN 'no threshold'
-                        WHEN ROUND(100.0 * fill_num / NULLIF(denom,0),1) >= green THEN 'green'
-                        WHEN ROUND(100.0 * fill_num / NULLIF(denom,0),1) >= red   THEN 'yellow'
-                        ELSE 'red'
-                    END AS status
-                FROM main_data_quality.summary
-                WHERE red IS NOT NULL
-            )
-        """).fetchone()
-        stats["dq_green"]  = dq[0]
-        stats["dq_yellow"] = dq[1]
-        stats["dq_red"]    = dq[2]
-        stats["dq_total"]  = dq[3]
+        dq = pd.read_parquet(DATA / "dq_quick_stats.parquet").iloc[0]
+        stats["dq_green"]  = int(dq["n_green"])
+        stats["dq_yellow"] = int(dq["n_yellow"])
+        stats["dq_red"]    = int(dq["n_red"])
+        stats["dq_total"]  = int(dq["n_total"])
     except Exception:
         pass
     return stats
@@ -54,7 +37,6 @@ def home():
     st.caption("Claims · Members · Providers · Data Quality — Synthetic dataset v0.15/0.16")
     st.divider()
 
-    # ── Quick stats ───────────────────────────────────────────────────────────
     stats = load_quick_stats()
 
     st.markdown("#### Dataset summary")
@@ -67,7 +49,6 @@ def home():
 
     st.divider()
 
-    # ── Report cards ──────────────────────────────────────────────────────────
     st.markdown("#### Available reports")
 
     reports = [
@@ -107,7 +88,6 @@ def home():
     st.caption("Stack: DuckDB 1.5 · dbt 1.11 · Tuva Project 0.17.2 · Streamlit 1.57")
 
 
-# ── Navigation ────────────────────────────────────────────────────────────────
 pg = st.navigation(
     [
         st.Page(home,                        title="Home",                   icon="🏠", default=True),

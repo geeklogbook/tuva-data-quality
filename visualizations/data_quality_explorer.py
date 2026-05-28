@@ -1,196 +1,125 @@
 import streamlit as st
-import duckdb
 import pandas as pd
 import altair as alt
+from pathlib import Path
 
-DB_PATH = "/home/j/Documents/geeklogbook/tuva-data-quality/tuva.duckdb"
-
-st.set_page_config(
-    page_title="Tuva Data Quality Explorer",
-    page_icon="🔍",
-    layout="wide",
-)
+DATA = Path(__file__).parent / "data"
 
 st.title("🔍 Tuva Data Quality Explorer")
 st.caption("Fill rates · Validity · Trends · Drill-down — Synthetic dataset v0.15/0.16")
 
 
-@st.cache_resource
-def get_conn():
-    return duckdb.connect(DB_PATH, read_only=True)
-
-
-@st.cache_data
-def query(sql, params=None):
-    con = get_conn()
-    if params:
-        return con.execute(sql, params).df()
-    return con.execute(sql).df()
-
-
-# ── Scorecard metrics ─────────────────────────────────────────────────────────
 @st.cache_data
 def load_summary():
-    return query("""
-        SELECT
-            table_name,
-            claim_type,
-            field_name,
-            data_source,
-            red,
-            green,
-            valid_num,
-            fill_num,
-            denom,
-            ROUND(100.0 * fill_num  / NULLIF(denom, 0), 1) AS fill_pct,
-            ROUND(100.0 * valid_num / NULLIF(denom, 0), 1) AS valid_pct,
-            CASE
-                WHEN green IS NULL THEN 'no threshold'
-                WHEN ROUND(100.0 * fill_num / NULLIF(denom, 0), 1) >= green THEN 'green'
-                WHEN ROUND(100.0 * fill_num / NULLIF(denom, 0), 1) >= red   THEN 'yellow'
-                ELSE 'red'
-            END AS status
-        FROM main_data_quality.summary
-        ORDER BY table_name, claim_type, field_name
-    """)
+    return pd.read_parquet(DATA / "dq_summary.parquet")
 
 
 @st.cache_data
+def load_dq_for_pbi():
+    return pd.read_parquet(DATA / "dq_for_pbi.parquet")
+
+
+@st.cache_data
+def load_quality_trend():
+    return pd.read_parquet(DATA / "dq_quality_trend.parquet")
+
+
 def load_payer_overview():
-    return query("""
-        SELECT
-            data_source,
-            table_name,
-            claim_type,
-            ROUND(AVG(100.0 * fill_num / NULLIF(denom, 0)), 1) AS avg_fill_pct,
-            COUNT(*) AS field_count
-        FROM main_data_quality.summary
-        WHERE data_source IS NOT NULL
-        GROUP BY data_source, table_name, claim_type
-        ORDER BY data_source, table_name
-    """)
+    df = load_summary()
+    df = df[df["data_source"].notna()]
+    return (
+        df.groupby(["data_source", "table_name", "claim_type"])
+        .agg(avg_fill_pct=("fill_pct", "mean"), field_count=("field_name", "count"))
+        .reset_index()
+        .round({"avg_fill_pct": 1})
+        .sort_values(["data_source", "table_name"])
+    )
 
 
-@st.cache_data
 def load_payer_field_detail(table):
-    return query("""
-        SELECT
-            data_source,
-            field_name,
-            claim_type,
-            ROUND(100.0 * fill_num / NULLIF(denom, 0), 1) AS fill_pct
-        FROM main_data_quality.summary
-        WHERE data_source IS NOT NULL AND table_name = ?
-        ORDER BY field_name, data_source
-    """, [table])
+    df = load_summary()
+    return (
+        df[df["data_source"].notna() & (df["table_name"] == table)]
+        [["data_source", "field_name", "claim_type", "fill_pct"]]
+        .sort_values(["field_name", "data_source"])
+    )
 
 
-@st.cache_data
 def load_fill_distribution():
-    return query("""
-        SELECT
-            CASE
-                WHEN fill_pct = 0    THEN '0% — completely empty'
-                WHEN fill_pct < 25   THEN '1–24%'
-                WHEN fill_pct < 50   THEN '25–49%'
-                WHEN fill_pct < 75   THEN '50–74%'
-                WHEN fill_pct < 90   THEN '75–89%'
-                WHEN fill_pct < 100  THEN '90–99%'
-                ELSE '100% — fully populated'
-            END AS bucket,
-            COUNT(*) AS fields,
-            CASE
-                WHEN fill_pct = 0    THEN 0
-                WHEN fill_pct < 25   THEN 1
-                WHEN fill_pct < 50   THEN 2
-                WHEN fill_pct < 75   THEN 3
-                WHEN fill_pct < 90   THEN 4
-                WHEN fill_pct < 100  THEN 5
-                ELSE 6
-            END AS sort_order
-        FROM (
-            SELECT ROUND(100.0 * fill_num / NULLIF(denom, 0), 1) AS fill_pct
-            FROM main_data_quality.summary
-        )
-        GROUP BY 1, 3
-        ORDER BY sort_order
-    """)
+    fill_pct = load_summary()["fill_pct"].dropna()
+
+    def bucket(x):
+        if x == 0:   return ("0% — completely empty",   0)
+        if x < 25:   return ("1–24%",                   1)
+        if x < 50:   return ("25–49%",                  2)
+        if x < 75:   return ("50–74%",                  3)
+        if x < 90:   return ("75–89%",                  4)
+        if x < 100:  return ("90–99%",                  5)
+        return             ("100% — fully populated",   6)
+
+    df_b = pd.DataFrame(fill_pct.apply(bucket).tolist(), columns=["bucket", "sort_order"])
+    return (
+        df_b.groupby(["bucket", "sort_order"]).size()
+        .reset_index(name="fields")
+        .sort_values("sort_order")
+    )
 
 
-@st.cache_data
 def load_null_volume():
-    return query("""
-        SELECT
-            table_name,
-            claim_type,
-            field_name,
-            denom,
-            ROUND(100.0 * fill_num / NULLIF(denom, 0), 1) AS fill_pct,
-            CAST(denom - fill_num AS BIGINT) AS null_records
-        FROM main_data_quality.summary
-        WHERE denom > 0 AND fill_num < denom
-        ORDER BY null_records DESC
-        LIMIT 20
-    """)
+    df = load_summary()
+    df = df[(df["denom"] > 0) & (df["fill_num"] < df["denom"])].copy()
+    df["null_records"] = (df["denom"] - df["fill_num"]).astype("Int64")
+    return (
+        df.sort_values("null_records", ascending=False)
+        .head(20)
+        [["table_name", "claim_type", "field_name", "denom", "fill_pct", "null_records"]]
+    )
 
 
-@st.cache_data
 def load_validity_by_table():
-    return query("""
-        SELECT
-            table_name,
-            ROUND(AVG(100.0 * valid_num / NULLIF(denom, 0)), 1) AS avg_valid_pct,
-            ROUND(AVG(100.0 * fill_num  / NULLIF(denom, 0)), 1) AS avg_fill_pct,
-            COUNT(*) AS fields
-        FROM main_data_quality.summary
-        WHERE denom > 0 AND valid_num IS NOT NULL
-          AND table_name NOT IN ('eligibility')
-        GROUP BY table_name
-        ORDER BY avg_valid_pct
-    """)
+    df = load_summary()
+    df = df[
+        (df["denom"] > 0) &
+        df["valid_num"].notna() &
+        ~df["table_name"].isin(["eligibility"])
+    ]
+    return (
+        df.groupby("table_name")
+        .agg(avg_valid_pct=("valid_pct", "mean"), avg_fill_pct=("fill_pct", "mean"), fields=("field_name", "count"))
+        .reset_index()
+        .round({"avg_valid_pct": 1, "avg_fill_pct": 1})
+        .sort_values("avg_valid_pct")
+    )
 
 
-@st.cache_data
 def load_invalid_reasons_volume():
-    return query("""
-        SELECT
-            invalid_reason,
-            bucket_name,
-            SUM(frequency)           AS total_records,
-            COUNT(DISTINCT field_name)  AS affected_fields,
-            COUNT(DISTINCT table_name)  AS affected_tables
-        FROM main_data_quality.data_quality_for_pbi
-        WHERE invalid_reason IS NOT NULL
-          AND bucket_name NOT IN ('valid')
-          AND invalid_reason NOT IN ('valid', 'multiple')
-        GROUP BY 1, 2
-        ORDER BY total_records DESC
-    """)
+    df = load_dq_for_pbi()
+    df = df[
+        df["invalid_reason"].notna() &
+        ~df["bucket_name"].isin(["valid"]) &
+        ~df["invalid_reason"].isin(["valid", "multiple"])
+    ]
+    return (
+        df.groupby(["invalid_reason", "bucket_name"])
+        .agg(total_records=("frequency", "sum"),
+             affected_fields=("field_name", "nunique"),
+             affected_tables=("table_name", "nunique"))
+        .reset_index()
+        .sort_values("total_records", ascending=False)
+    )
 
 
-@st.cache_data
 def load_worst_fields():
-    return query("""
-        SELECT
-            table_name,
-            claim_type,
-            field_name,
-            CAST(red AS DOUBLE) AS red,
-            CAST(green AS DOUBLE) AS green,
-            ROUND(100.0 * fill_num / NULLIF(denom, 0), 1) AS fill_pct,
-            CASE
-                WHEN ROUND(100.0 * fill_num / NULLIF(denom, 0), 1) >= green THEN 'green'
-                WHEN ROUND(100.0 * fill_num / NULLIF(denom, 0), 1) >= red   THEN 'yellow'
-                ELSE 'red'
-            END AS status
-        FROM main_data_quality.summary
-        WHERE red IS NOT NULL
-          AND ROUND(100.0 * fill_num / NULLIF(denom, 0), 1) < green
-        ORDER BY fill_pct ASC
-        LIMIT 20
-    """)
+    df = load_summary()
+    df = df[df["red"].notna() & (df["fill_pct"] < df["green"])].copy()
+    return (
+        df.sort_values("fill_pct")
+        .head(20)
+        [["table_name", "claim_type", "field_name", "red", "green", "fill_pct", "status"]]
+    )
 
 
+# ── Scorecard header ───────────────────────────────────────────────────────────
 df_summary = load_summary()
 
 with_threshold = df_summary[df_summary["status"] != "no threshold"]
@@ -223,7 +152,6 @@ st.caption(
 
 st.divider()
 
-# ── About: what type of DQ is being analysed ─────────────────────────────────
 with st.expander("ℹ️  What data quality dimensions does this dashboard measure?", expanded=False):
     st.markdown("""
 This dashboard runs the **[Tuva Project](https://thetuvaproject.com/) data quality framework**
@@ -250,30 +178,20 @@ against a synthetic Medicare claims dataset. It evaluates six dimensions of data
 - **225 field-level quality checks** across all tables
 """)
 
-# ── Tabs ──────────────────────────────────────────────────────────────────────
+# ── Tabs ───────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
-    "Scorecard",
-    "Field detail",
-    "Trends",
-    "Invalid drill-down",
-    "Payer comparison",
-    "Worst fields",
-    "Data profiling",
-    "Recommendations",
+    "Scorecard", "Field detail", "Trends", "Invalid drill-down",
+    "Payer comparison", "Worst fields", "Data profiling", "Recommendations",
 ])
 
-# ── Tab 1: Scorecard ──────────────────────────────────────────────────────────
+# ── Tab 1: Scorecard ───────────────────────────────────────────────────────────
 with tab1:
     st.subheader("Fill rate by table and field")
 
     tables_avail = sorted(df_summary["table_name"].dropna().unique())
-    sel_tables = st.multiselect(
-        "Filter by table", tables_avail, default=tables_avail, key="t1_tables"
-    )
-
+    sel_tables = st.multiselect("Filter by table", tables_avail, default=tables_avail, key="t1_tables")
     df_view = df_summary[df_summary["table_name"].isin(sel_tables)].copy()
 
-    # Status distribution bar
     status_counts = (
         df_view[df_view["status"] != "no threshold"]
         .groupby("status", as_index=False)
@@ -282,57 +200,38 @@ with tab1:
     )
     color_map = {"green": "#2ca02c", "yellow": "#f0c05a", "red": "#d62728"}
     if not status_counts.empty:
-        bar = (
-            alt.Chart(status_counts)
-            .mark_bar()
-            .encode(
+        st.altair_chart(
+            alt.Chart(status_counts).mark_bar().encode(
                 x=alt.X("fields:Q", title="Fields"),
                 y=alt.Y("status:N", sort=["red", "yellow", "green"], title="Status"),
                 color=alt.Color(
                     "status:N",
-                    scale=alt.Scale(
-                        domain=list(color_map.keys()),
-                        range=list(color_map.values()),
-                    ),
+                    scale=alt.Scale(domain=list(color_map.keys()), range=list(color_map.values())),
                     legend=None,
                 ),
                 tooltip=["status", "fields"],
-            )
-            .properties(title="Status distribution (fields with threshold)", height=180)
+            ).properties(title="Status distribution (fields with threshold)", height=180),
+            use_container_width=True,
         )
-        st.altair_chart(bar, use_container_width=True)
 
-    # Heatmap fill_pct by table
     st.markdown("##### Fill rate heatmap by table")
-    hm_data = (
-        df_view.groupby(["table_name", "claim_type"], as_index=False)["fill_pct"]
-        .mean()
-        .round(1)
-    )
-    hm_data["label"] = hm_data["fill_pct"].astype(str) + "%"
+    hm_data = df_view.groupby(["table_name", "claim_type"], as_index=False)["fill_pct"].mean().round(1)
 
-    heatmap = (
-        alt.Chart(hm_data)
-        .mark_rect()
-        .encode(
-            x=alt.X("claim_type:N", title="Claim type"),
-            y=alt.Y("table_name:N", title="Table"),
-            color=alt.Color(
-                "fill_pct:Q",
-                scale=alt.Scale(domain=[0, 50, 100], range=["#d62728", "#f0c05a", "#2ca02c"]),
-                legend=alt.Legend(title="Avg fill %"),
-            ),
-            tooltip=["table_name", "claim_type", "fill_pct"],
-        )
-        .properties(title="Average fill rate by table / claim type", height=300)
-    )
+    heatmap = alt.Chart(hm_data).mark_rect().encode(
+        x=alt.X("claim_type:N", title="Claim type"),
+        y=alt.Y("table_name:N", title="Table"),
+        color=alt.Color(
+            "fill_pct:Q",
+            scale=alt.Scale(domain=[0, 50, 100], range=["#d62728", "#f0c05a", "#2ca02c"]),
+            legend=alt.Legend(title="Avg fill %"),
+        ),
+        tooltip=["table_name", "claim_type", "fill_pct"],
+    ).properties(title="Average fill rate by table / claim type", height=300)
     text = heatmap.mark_text(baseline="middle", fontSize=11).encode(
-        text=alt.Text("fill_pct:Q", format=".1f"),
-        color=alt.value("white"),
+        text=alt.Text("fill_pct:Q", format=".1f"), color=alt.value("white"),
     )
     st.altair_chart(heatmap + text, use_container_width=True)
 
-    # Full table
     status_emoji = {"green": "🟢", "yellow": "🟡", "red": "🔴", "no threshold": "⚪"}
     df_display = df_view.copy()
     df_display["status_icon"] = df_display["status"].map(status_emoji)
@@ -355,20 +254,15 @@ with tab2:
     with col_sel1:
         t2_table = st.selectbox("Table", sorted(df_summary["table_name"].dropna().unique()), key="t2_table")
     with col_sel2:
-        fields_for_table = sorted(
-            df_summary[df_summary["table_name"] == t2_table]["field_name"].dropna().unique()
-        )
+        fields_for_table = sorted(df_summary[df_summary["table_name"] == t2_table]["field_name"].dropna().unique())
         t2_field = st.selectbox("Field", fields_for_table, key="t2_field")
     with col_sel3:
         claim_types_for = sorted(
-            df_summary[
-                (df_summary["table_name"] == t2_table) &
-                (df_summary["field_name"] == t2_field)
-            ]["claim_type"].dropna().unique()
+            df_summary[(df_summary["table_name"] == t2_table) & (df_summary["field_name"] == t2_field)]
+            ["claim_type"].dropna().unique()
         )
         t2_claim_type = st.selectbox("Claim type", claim_types_for, key="t2_claim_type") if claim_types_for else None
 
-    # Thresholds for selected field
     row = df_summary[
         (df_summary["table_name"] == t2_table) &
         (df_summary["field_name"] == t2_field) &
@@ -377,84 +271,63 @@ with tab2:
     if not row.empty:
         r = row.iloc[0]
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Fill %",  f"{r['fill_pct']}%" if pd.notna(r["fill_pct"]) else "N/A")
-        m2.metric("Valid %", f"{r['valid_pct']}%" if pd.notna(r["valid_pct"]) else "N/A")
-        m3.metric("Green threshold ≥", f"{r['green']}%" if pd.notna(r["green"]) else "—")
-        m4.metric("Red threshold <",   f"{r['red']}%"  if pd.notna(r["red"])   else "—")
+        m1.metric("Fill %",            f"{r['fill_pct']}%"  if pd.notna(r["fill_pct"])  else "N/A")
+        m2.metric("Valid %",           f"{r['valid_pct']}%" if pd.notna(r["valid_pct"]) else "N/A")
+        m3.metric("Green threshold ≥", f"{r['green']}%"     if pd.notna(r["green"])     else "—")
+        m4.metric("Red threshold <",   f"{r['red']}%"       if pd.notna(r["red"])       else "—")
 
-    # Bucket distribution
     try:
-        df_buckets = query("""
-            SELECT
-                bucket_name,
-                SUM(frequency) AS total
-            FROM main_data_quality.data_quality_for_pbi
-            WHERE table_name = ? AND field_name = ?
-            GROUP BY bucket_name
-            ORDER BY total DESC
-        """, [t2_table, t2_field])
+        df_pbi = load_dq_for_pbi()
+        df_buckets = (
+            df_pbi[(df_pbi["table_name"] == t2_table) & (df_pbi["field_name"] == t2_field)]
+            .groupby("bucket_name", as_index=False)["frequency"].sum()
+            .rename(columns={"frequency": "total"})
+            .sort_values("total", ascending=False)
+        )
 
         if not df_buckets.empty:
             bucket_colors = {
-                "valid":     "#2ca02c",
-                "null":      "#aec7e8",
-                "invalid":   "#d62728",
-                "multiple":  "#ff7f0e",
-                "duplicate": "#9467bd",
+                "valid": "#2ca02c", "null": "#aec7e8",
+                "invalid": "#d62728", "multiple": "#ff7f0e", "duplicate": "#9467bd",
             }
             col_a, col_b = st.columns([1, 2])
             with col_a:
-                pie = (
-                    alt.Chart(df_buckets)
-                    .mark_arc(innerRadius=50)
-                    .encode(
+                st.altair_chart(
+                    alt.Chart(df_buckets).mark_arc(innerRadius=50).encode(
                         theta="total:Q",
                         color=alt.Color(
                             "bucket_name:N",
-                            scale=alt.Scale(
-                                domain=list(bucket_colors.keys()),
-                                range=list(bucket_colors.values()),
-                            ),
+                            scale=alt.Scale(domain=list(bucket_colors.keys()), range=list(bucket_colors.values())),
                             legend=alt.Legend(title="Bucket"),
                         ),
                         tooltip=["bucket_name", "total"],
-                    )
-                    .properties(title="Bucket distribution", height=280)
+                    ).properties(title="Bucket distribution", height=280),
+                    use_container_width=True,
                 )
-                st.altair_chart(pie, use_container_width=True)
             with col_b:
                 st.dataframe(df_buckets, use_container_width=True, hide_index=True)
         else:
             st.info("No data found in data_quality_for_pbi for this field.")
-    except Exception as e:
-        st.error(f"Error loading buckets: {e}")
 
-    # Invalid examples
-    st.markdown("##### Invalid / null record samples")
-    try:
-        df_invalid = query("""
-            SELECT
-                bucket_name,
-                invalid_reason,
-                field_value,
-                drill_down_key,
-                drill_down_value,
-                frequency
-            FROM main_data_quality.data_quality_for_pbi
-            WHERE table_name = ?
-              AND field_name = ?
-              AND bucket_name NOT IN ('valid')
-            ORDER BY frequency DESC
-            LIMIT 200
-        """, [t2_table, t2_field])
+        st.markdown("##### Invalid / null record samples")
+        df_invalid = (
+            df_pbi[
+                (df_pbi["table_name"] == t2_table) &
+                (df_pbi["field_name"] == t2_field) &
+                (df_pbi["bucket_name"] != "valid")
+            ]
+            .sort_values("frequency", ascending=False)
+            .head(200)
+            [["bucket_name", "invalid_reason", "field_value", "drill_down_key", "drill_down_value", "frequency"]]
+        )
         if not df_invalid.empty:
             st.dataframe(df_invalid, use_container_width=True, hide_index=True)
         else:
             st.success("No invalid or null records found for this field.")
     except Exception as e:
-        st.error(f"Error loading examples: {e}")
+        st.error(f"Error loading field detail: {e}")
 
-# ── Tab 3: Trends ─────────────────────────────────────────────────────────────
+# ── Tab 3: Trends ──────────────────────────────────────────────────────────────
 with tab3:
     st.subheader("Fill rate trend over time")
 
@@ -462,47 +335,29 @@ with tab3:
     with col_t1:
         t3_table = st.selectbox("Table", sorted(df_summary["table_name"].dropna().unique()), key="t3_table")
     with col_t2:
-        t3_fields = sorted(
-            df_summary[df_summary["table_name"] == t3_table]["field_name"].dropna().unique()
-        )
-        t3_fields_sel = st.multiselect(
-            "Fields (max 10)", t3_fields, default=t3_fields[:5], key="t3_fields", max_selections=10
-        )
+        t3_fields = sorted(df_summary[df_summary["table_name"] == t3_table]["field_name"].dropna().unique())
+        t3_fields_sel = st.multiselect("Fields (max 10)", t3_fields, default=t3_fields[:5], key="t3_fields", max_selections=10)
 
     if t3_fields_sel:
         try:
-            placeholders = ", ".join(["?"] * len(t3_fields_sel))
-            df_trend = query(f"""
-                SELECT
-                    t.first_day_of_month,
-                    s.field_name,
-                    s.claim_type,
-                    ROUND(100.0 * t.fill_num / NULLIF(t.denom, 0), 1) AS fill_pct
-                FROM main_data_quality.quality_trend t
-                JOIN main_data_quality.summary s ON t.summary_sk = s.summary_sk
-                WHERE s.table_name = ?
-                  AND s.field_name IN ({placeholders})
-                ORDER BY t.first_day_of_month, s.field_name
-            """, [t3_table] + t3_fields_sel)
+            df_trend_full = load_quality_trend()
+            mask = (df_trend_full["table_name"] == t3_table) & (df_trend_full["field_name"].isin(t3_fields_sel))
+            df_trend = df_trend_full[mask].copy()
 
             if not df_trend.empty:
                 df_trend["field_label"] = df_trend["field_name"] + " (" + df_trend["claim_type"] + ")"
-                trend_chart = (
-                    alt.Chart(df_trend)
-                    .mark_line(point=True)
-                    .encode(
+                st.altair_chart(
+                    alt.Chart(df_trend).mark_line(point=True).encode(
                         x=alt.X("first_day_of_month:T", title="Month"),
                         y=alt.Y("fill_pct:Q", title="Fill %", scale=alt.Scale(domain=[0, 100])),
                         color=alt.Color("field_label:N", legend=alt.Legend(title="Field")),
                         tooltip=["first_day_of_month:T", "field_label", "fill_pct"],
-                    )
-                    .properties(title="Monthly fill rate by field", height=420)
+                    ).properties(title="Monthly fill rate by field", height=420),
+                    use_container_width=True,
                 )
-                st.altair_chart(trend_chart, use_container_width=True)
                 st.dataframe(
                     df_trend.sort_values("first_day_of_month", ascending=False),
-                    use_container_width=True,
-                    hide_index=True,
+                    use_container_width=True, hide_index=True,
                 )
             else:
                 st.info("No trend data available for the current selection.")
@@ -511,7 +366,7 @@ with tab3:
     else:
         st.info("Select at least one field.")
 
-# ── Tab 4: Invalid drill-down ─────────────────────────────────────────────────
+# ── Tab 4: Invalid drill-down ──────────────────────────────────────────────────
 with tab4:
     st.subheader("Invalid record drill-down")
 
@@ -520,81 +375,48 @@ with tab4:
         t4_tables = sorted(df_summary["table_name"].dropna().unique())
         t4_table = st.selectbox("Table", ["(all)"] + t4_tables, key="t4_table")
     with col_f2:
-        if t4_table != "(all)":
-            t4_field_opts = sorted(
-                df_summary[df_summary["table_name"] == t4_table]["field_name"].dropna().unique()
-            )
-        else:
-            t4_field_opts = sorted(df_summary["field_name"].dropna().unique())
+        t4_field_opts = sorted(
+            (df_summary[df_summary["table_name"] == t4_table] if t4_table != "(all)" else df_summary)
+            ["field_name"].dropna().unique()
+        )
         t4_field = st.selectbox("Field", ["(all)"] + t4_field_opts, key="t4_field")
     with col_f3:
         try:
-            reasons_df = query("""
-                SELECT DISTINCT invalid_reason
-                FROM main_data_quality.data_quality_for_pbi
-                WHERE invalid_reason IS NOT NULL
-                  AND bucket_name NOT IN ('valid')
-                ORDER BY invalid_reason
-            """)
-            reason_opts = reasons_df["invalid_reason"].tolist()
+            df_pbi = load_dq_for_pbi()
+            reason_opts = sorted(
+                df_pbi[df_pbi["invalid_reason"].notna() & (df_pbi["bucket_name"] != "valid")]
+                ["invalid_reason"].unique().tolist()
+            )
         except Exception:
             reason_opts = []
         t4_reason = st.selectbox("Invalid reason", ["(all)"] + reason_opts, key="t4_reason")
 
     try:
-        where_clauses = ["bucket_name NOT IN ('valid')"]
-        params = []
-        if t4_table != "(all)":
-            where_clauses.append("table_name = ?")
-            params.append(t4_table)
-        if t4_field != "(all)":
-            where_clauses.append("field_name = ?")
-            params.append(t4_field)
-        if t4_reason != "(all)":
-            where_clauses.append("invalid_reason = ?")
-            params.append(t4_reason)
+        df_pbi = load_dq_for_pbi()
+        mask = df_pbi["bucket_name"] != "valid"
+        if t4_table  != "(all)": mask &= df_pbi["table_name"]     == t4_table
+        if t4_field  != "(all)": mask &= df_pbi["field_name"]      == t4_field
+        if t4_reason != "(all)": mask &= df_pbi["invalid_reason"]  == t4_reason
 
-        where_sql = " AND ".join(where_clauses)
-
-        df_drill = query(f"""
-            SELECT
-                table_name,
-                field_name,
-                bucket_name,
-                invalid_reason,
-                field_value,
-                drill_down_key,
-                drill_down_value,
-                frequency
-            FROM main_data_quality.data_quality_for_pbi
-            WHERE {where_sql}
-            ORDER BY frequency DESC
-            LIMIT 500
-        """, params if params else None)
+        df_drill = df_pbi[mask].sort_values("frequency", ascending=False).head(500)
 
         if not df_drill.empty:
-            # Summary by reason
             reason_summary = (
                 df_drill.groupby(["bucket_name", "invalid_reason"], as_index=False)["frequency"]
-                .sum()
-                .sort_values("frequency", ascending=False)
+                .sum().sort_values("frequency", ascending=False)
             )
-
             col_a, col_b = st.columns([2, 3])
             with col_a:
                 st.markdown("**Frequency by reason**")
-                reason_bar = (
-                    alt.Chart(reason_summary)
-                    .mark_bar()
-                    .encode(
+                st.altair_chart(
+                    alt.Chart(reason_summary).mark_bar().encode(
                         x=alt.X("frequency:Q", title="Records"),
                         y=alt.Y("invalid_reason:N", sort="-x", title="Reason"),
                         color=alt.Color("bucket_name:N", legend=alt.Legend(title="Bucket")),
                         tooltip=["bucket_name", "invalid_reason", "frequency"],
-                    )
-                    .properties(height=max(200, len(reason_summary) * 28))
+                    ).properties(height=max(200, len(reason_summary) * 28)),
+                    use_container_width=True,
                 )
-                st.altair_chart(reason_bar, use_container_width=True)
             with col_b:
                 st.markdown(f"**Records (top 500)** — {len(df_drill):,} rows")
                 st.dataframe(df_drill, use_container_width=True, hide_index=True)
@@ -603,7 +425,7 @@ with tab4:
     except Exception as e:
         st.error(f"Error in drill-down: {e}")
 
-# ── Tab 5: Payer comparison ───────────────────────────────────────────────────
+# ── Tab 5: Payer comparison ────────────────────────────────────────────────────
 with tab5:
     st.subheader("Fill rate by data source / payer")
     st.caption("Data source (emr, labcorp, medicare cclf) is the payer dimension in this dataset.")
@@ -612,53 +434,43 @@ with tab5:
         df_payer_ov = load_payer_overview()
         df_payer_ov = df_payer_ov[df_payer_ov["data_source"].notna()]
 
-        # Overview grouped bar
-        overview_chart = (
-            alt.Chart(df_payer_ov)
-            .mark_bar()
-            .encode(
+        st.altair_chart(
+            alt.Chart(df_payer_ov).mark_bar().encode(
                 x=alt.X("data_source:N", title="Data source", axis=alt.Axis(labelAngle=-20)),
                 y=alt.Y("avg_fill_pct:Q", title="Avg fill %", scale=alt.Scale(domain=[0, 100])),
                 color=alt.Color("data_source:N", legend=None),
                 column=alt.Column("table_name:N", title="Table", header=alt.Header(labelAngle=-15)),
                 tooltip=["data_source", "table_name", "claim_type", "avg_fill_pct", "field_count"],
-            )
-            .properties(width=120, height=280, title="Average fill rate by payer and table")
+            ).properties(width=120, height=280, title="Average fill rate by payer and table")
         )
-        st.altair_chart(overview_chart)
 
         st.divider()
-
-        # Field-level detail
         st.markdown("##### Field-level breakdown by payer")
         payer_tables = sorted(df_payer_ov["table_name"].unique())
         sel_payer_table = st.selectbox("Table", payer_tables, key="t5_table")
 
         df_payer_detail = load_payer_field_detail(sel_payer_table)
         if not df_payer_detail.empty:
-            detail_chart = (
-                alt.Chart(df_payer_detail)
-                .mark_bar()
-                .encode(
+            st.altair_chart(
+                alt.Chart(df_payer_detail).mark_bar().encode(
                     x=alt.X("fill_pct:Q", title="Fill %", scale=alt.Scale(domain=[0, 100])),
                     y=alt.Y("field_name:N", sort="-x", title="Field"),
                     color=alt.Color("data_source:N", legend=alt.Legend(title="Data source")),
                     xOffset=alt.XOffset("data_source:N"),
                     tooltip=["data_source", "field_name", "claim_type", "fill_pct"],
-                )
-                .properties(
+                ).properties(
                     title=f"Field fill rate by payer — {sel_payer_table}",
                     height=max(300, len(df_payer_detail["field_name"].unique()) * 26),
-                )
+                ),
+                use_container_width=True,
             )
-            st.altair_chart(detail_chart, use_container_width=True)
             st.dataframe(df_payer_detail, use_container_width=True, hide_index=True)
         else:
             st.info("No data available for the selected table.")
     except Exception as e:
         st.error(f"Error loading payer comparison: {e}")
 
-# ── Tab 6: Worst fields ───────────────────────────────────────────────────────
+# ── Tab 6: Worst fields ────────────────────────────────────────────────────────
 with tab6:
     st.subheader("Worst fields — lowest fill rate")
 
@@ -667,59 +479,42 @@ with tab6:
 
         if not df_worst.empty:
             n_show = st.slider("Number of fields to show", min_value=5, max_value=20, value=10, key="t6_n")
-            df_worst = df_worst.head(n_show)
-            df_worst["field_label"] = df_worst["field_name"] + "\n(" + df_worst["table_name"] + " · " + df_worst["claim_type"] + ")"
+            df_worst = df_worst.head(n_show).copy()
+            df_worst["field_label"] = (
+                df_worst["field_name"] + "\n(" + df_worst["table_name"] + " · " + df_worst["claim_type"] + ")"
+            )
 
             status_colors = {"red": "#d62728", "yellow": "#f0c05a"}
-
-            bars = (
-                alt.Chart(df_worst)
-                .mark_bar()
-                .encode(
-                    x=alt.X("fill_pct:Q", title="Fill %", scale=alt.Scale(domain=[0, 100])),
-                    y=alt.Y("field_label:N", sort="x", title="Field"),
-                    color=alt.Color(
-                        "status:N",
-                        scale=alt.Scale(
-                            domain=list(status_colors.keys()),
-                            range=list(status_colors.values()),
-                        ),
-                        legend=alt.Legend(title="Status"),
-                    ),
-                    tooltip=["field_name", "table_name", "claim_type", "fill_pct", "status", "red", "green"],
-                )
+            bars = alt.Chart(df_worst).mark_bar().encode(
+                x=alt.X("fill_pct:Q", title="Fill %", scale=alt.Scale(domain=[0, 100])),
+                y=alt.Y("field_label:N", sort="x", title="Field"),
+                color=alt.Color(
+                    "status:N",
+                    scale=alt.Scale(domain=list(status_colors.keys()), range=list(status_colors.values())),
+                    legend=alt.Legend(title="Status"),
+                ),
+                tooltip=["field_name", "table_name", "claim_type", "fill_pct", "status", "red", "green"],
             )
-
-            red_ticks = (
-                alt.Chart(df_worst)
-                .mark_tick(color="#d62728", thickness=2, size=18)
-                .encode(
-                    x=alt.X("red:Q", title=""),
-                    y=alt.Y("field_label:N", sort="x"),
-                    tooltip=[alt.Tooltip("red:Q", title="Red threshold")],
-                )
+            red_ticks = alt.Chart(df_worst).mark_tick(color="#d62728", thickness=2, size=18).encode(
+                x=alt.X("red:Q", title=""),
+                y=alt.Y("field_label:N", sort="x"),
+                tooltip=[alt.Tooltip("red:Q", title="Red threshold")],
             )
-
-            green_ticks = (
-                alt.Chart(df_worst)
-                .mark_tick(color="#2ca02c", thickness=2, size=18)
-                .encode(
-                    x=alt.X("green:Q", title=""),
-                    y=alt.Y("field_label:N", sort="x"),
-                    tooltip=[alt.Tooltip("green:Q", title="Green threshold")],
-                )
+            green_ticks = alt.Chart(df_worst).mark_tick(color="#2ca02c", thickness=2, size=18).encode(
+                x=alt.X("green:Q", title=""),
+                y=alt.Y("field_label:N", sort="x"),
+                tooltip=[alt.Tooltip("green:Q", title="Green threshold")],
             )
-
-            chart = (bars + red_ticks + green_ticks).properties(
-                title="Lowest fill rate fields (🔴 tick = red threshold, 🟢 tick = green threshold)",
-                height=max(300, n_show * 36),
+            st.altair_chart(
+                (bars + red_ticks + green_ticks).properties(
+                    title="Lowest fill rate fields (🔴 tick = red threshold, 🟢 tick = green threshold)",
+                    height=max(300, n_show * 36),
+                ),
+                use_container_width=True,
             )
-            st.altair_chart(chart, use_container_width=True)
-
             st.dataframe(
                 df_worst[["status", "table_name", "claim_type", "field_name", "fill_pct", "red", "green"]],
-                use_container_width=True,
-                hide_index=True,
+                use_container_width=True, hide_index=True,
                 column_config={
                     "fill_pct": st.column_config.ProgressColumn("Fill %", min_value=0, max_value=100, format="%.1f%%"),
                 },
@@ -729,7 +524,7 @@ with tab6:
     except Exception as e:
         st.error(f"Error loading worst fields: {e}")
 
-# ── Tab 7: Data profiling ─────────────────────────────────────────────────────
+# ── Tab 7: Data profiling ──────────────────────────────────────────────────────
 with tab7:
     st.subheader("Data profiling")
     st.caption("Statistical summary of field population, null volumes, and validity across all tables.")
@@ -741,22 +536,12 @@ with tab7:
             st.markdown("##### Fill rate distribution")
             st.caption("How many fields fall into each fill-rate band.")
             df_dist = load_fill_distribution()
-            dist_chart = (
-                alt.Chart(df_dist)
-                .mark_bar()
-                .encode(
-                    x=alt.X("fields:Q", title="Number of fields"),
-                    y=alt.Y("bucket:N", sort=alt.EncodingSortField("sort_order", order="ascending"),
-                            title="Fill rate band"),
-                    color=alt.Color(
-                        "sort_order:O",
-                        scale=alt.Scale(scheme="redyellowgreen"),
-                        legend=None,
-                    ),
-                    tooltip=["bucket", "fields"],
-                )
-                .properties(height=260)
-            )
+            dist_chart = alt.Chart(df_dist).mark_bar().encode(
+                x=alt.X("fields:Q", title="Number of fields"),
+                y=alt.Y("bucket:N", sort=alt.EncodingSortField("sort_order", order="ascending"), title="Fill rate band"),
+                color=alt.Color("sort_order:O", scale=alt.Scale(scheme="redyellowgreen"), legend=None),
+                tooltip=["bucket", "fields"],
+            ).properties(height=260)
             text_dist = dist_chart.mark_text(align="left", dx=4).encode(
                 text="fields:Q", color=alt.value("#333")
             )
@@ -778,65 +563,49 @@ with tab7:
                 df_val_melt = df_val.melt(
                     id_vars=["table_name", "fields"],
                     value_vars=["avg_fill_pct", "avg_valid_pct"],
-                    var_name="metric", value_name="pct"
+                    var_name="metric", value_name="pct",
                 )
-                df_val_melt["metric"] = df_val_melt["metric"].map({
-                    "avg_fill_pct": "Fill rate",
-                    "avg_valid_pct": "Validity rate",
-                })
-                val_chart = (
-                    alt.Chart(df_val_melt)
-                    .mark_bar()
-                    .encode(
+                df_val_melt["metric"] = df_val_melt["metric"].map({"avg_fill_pct": "Fill rate", "avg_valid_pct": "Validity rate"})
+                st.altair_chart(
+                    alt.Chart(df_val_melt).mark_bar().encode(
                         x=alt.X("pct:Q", title="Average %", scale=alt.Scale(domain=[0, 100])),
                         y=alt.Y("table_name:N", sort="-x", title="Table"),
                         color=alt.Color(
                             "metric:N",
-                            scale=alt.Scale(
-                                domain=["Fill rate", "Validity rate"],
-                                range=["#4c78a8", "#72b7b2"],
-                            ),
+                            scale=alt.Scale(domain=["Fill rate", "Validity rate"], range=["#4c78a8", "#72b7b2"]),
                             legend=alt.Legend(title="Metric"),
                         ),
                         xOffset="metric:N",
                         tooltip=["table_name", "metric", "pct", "fields"],
-                    )
-                    .properties(height=260)
+                    ).properties(height=260),
+                    use_container_width=True,
                 )
-                st.altair_chart(val_chart, use_container_width=True)
 
         st.divider()
-
         col_c, col_d = st.columns(2)
 
         with col_c:
             st.markdown("##### Top fields by null record volume")
             st.caption("Fields with the highest absolute number of missing records — prioritize these for remediation.")
             df_nulls = load_null_volume()
-            null_chart = (
-                alt.Chart(df_nulls.head(15))
-                .mark_bar(color="#d62728")
-                .encode(
+            st.altair_chart(
+                alt.Chart(df_nulls.head(15)).mark_bar(color="#d62728").encode(
                     x=alt.X("null_records:Q", title="Null records"),
                     y=alt.Y("field_name:N", sort="-x", title="Field"),
                     tooltip=["table_name", "claim_type", "field_name", "null_records", "fill_pct"],
-                )
-                .properties(height=360)
+                ).properties(height=360),
+                use_container_width=True,
             )
-            st.altair_chart(null_chart, use_container_width=True)
 
         with col_d:
             st.markdown("##### Invalid records by reason")
             st.caption("Root causes of validity failures, ranked by total records affected.")
             df_reasons = load_invalid_reasons_volume()
             if not df_reasons.empty:
-                reason_chart = (
-                    alt.Chart(df_reasons)
-                    .mark_bar()
-                    .encode(
+                st.altair_chart(
+                    alt.Chart(df_reasons).mark_bar().encode(
                         x=alt.X("total_records:Q", title="Records affected"),
-                        y=alt.Y("invalid_reason:N", sort="-x", title=None,
-                                axis=alt.Axis(labelLimit=280)),
+                        y=alt.Y("invalid_reason:N", sort="-x", title=None, axis=alt.Axis(labelLimit=280)),
                         color=alt.Color(
                             "bucket_name:N",
                             scale=alt.Scale(
@@ -845,12 +614,10 @@ with tab7:
                             ),
                             legend=alt.Legend(title="Bucket"),
                         ),
-                        tooltip=["invalid_reason", "bucket_name", "total_records",
-                                 "affected_fields", "affected_tables"],
-                    )
-                    .properties(height=360)
+                        tooltip=["invalid_reason", "bucket_name", "total_records", "affected_fields", "affected_tables"],
+                    ).properties(height=360),
+                    use_container_width=True,
                 )
-                st.altair_chart(reason_chart, use_container_width=True)
 
         st.divider()
         st.dataframe(load_null_volume(), use_container_width=True, hide_index=True)
@@ -858,8 +625,7 @@ with tab7:
     except Exception as e:
         st.error(f"Error loading profiling data: {e}")
 
-
-# ── Tab 8: Recommendations ────────────────────────────────────────────────────
+# ── Tab 8: Recommendations ─────────────────────────────────────────────────────
 with tab8:
     st.subheader("Data quality recommendations")
     st.caption("Auto-generated from the actual data — sorted by impact (records affected × field importance).")
@@ -869,12 +635,11 @@ with tab8:
         df_nulls    = load_null_volume()
         df_worst    = load_worst_fields()
 
-        # ── Summary sentence ─────────────────────────────────────────────────
-        n_red_fields   = (df_summary["status"] == "red").sum()
+        n_red_fields    = (df_summary["status"] == "red").sum()
         n_yellow_fields = (df_summary["status"] == "yellow").sum()
-        n_empty_fields = (df_summary["fill_pct"].fillna(0) == 0).sum()
-        total_null_vol = int(df_nulls["null_records"].sum()) if not df_nulls.empty else 0
-        top_reason     = df_reasons.iloc[0] if not df_reasons.empty else None
+        n_empty_fields  = (df_summary["fill_pct"].fillna(0) == 0).sum()
+        total_null_vol  = int(df_nulls["null_records"].sum()) if not df_nulls.empty else 0
+        top_reason      = df_reasons.iloc[0] if not df_reasons.empty else None
 
         st.markdown(f"""
 **{n_red_fields} fields are in red status** and **{n_yellow_fields} are in yellow** across this dataset.
@@ -885,7 +650,6 @@ affecting **{int(top_reason['total_records']):,} records**.
 
         st.divider()
 
-        # ── Priority 1: Critical ─────────────────────────────────────────────
         st.markdown("### 🔴 Priority 1 — Critical")
         st.markdown("These issues affect the largest number of records and/or block downstream analytics.")
 
@@ -926,7 +690,6 @@ Unix epoch zero (`1970-01-01`), or incorrectly formatted dates parsed as very ol
 
         st.divider()
 
-        # ── Priority 2: High ─────────────────────────────────────────────────
         st.markdown("### 🟡 Priority 2 — High")
         st.markdown("Significant gaps that impact analytics and reporting accuracy.")
 
@@ -981,7 +744,6 @@ cannot be performed for professional claims.
 
         st.divider()
 
-        # ── Priority 3: Medium ────────────────────────────────────────────────
         st.markdown("### 🟠 Priority 3 — Medium")
         st.markdown("Targeted issues with lower volume but specific terminology mismatches.")
 
@@ -1017,7 +779,6 @@ cannot be performed for professional claims.
 
         st.divider()
 
-        # ── Next steps ────────────────────────────────────────────────────────
         st.markdown("### Next steps")
         cols = st.columns(3)
         with cols[0]:
@@ -1046,7 +807,6 @@ cannot be performed for professional claims.
 - Set alerts when any field drops below red threshold
 """.format(dqi_score))
 
-        # ── Download recommendations ──────────────────────────────────────────
         st.divider()
         recs = [
             {"priority": "Critical", "issue": "HCPCS code validity", "records_affected": 129575,
@@ -1066,10 +826,9 @@ cannot be performed for professional claims.
             {"priority": "Medium", "issue": "Race / dual-status code mismatches", "records_affected": 834,
              "table": "ELIGIBILITY", "action": "Map source codes to Tuva terminology value sets; validate dual eligibility file load"},
         ]
-        df_recs = pd.DataFrame(recs)
         st.download_button(
             label="⬇ Download recommendations as CSV",
-            data=df_recs.to_csv(index=False).encode("utf-8"),
+            data=pd.DataFrame(recs).to_csv(index=False).encode("utf-8"),
             file_name="dq_recommendations.csv",
             mime="text/csv",
         )

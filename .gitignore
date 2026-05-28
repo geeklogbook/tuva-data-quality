@@ -1,0 +1,23 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# dbt
+target/
+dbt_packages/
+logs/
+
+# DuckDB
+*.duckdb
+*.duckdb.wal
+
+# Streamlit
+.streamlit/
+
+# Claude Code
+.claude/settings.local.json
+
+# OS
+.DS_Store
